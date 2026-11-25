@@ -111,17 +111,37 @@ enter_in_el2:
     msr spsel, #0
     mov sp, x1
 
+    // The firmware may run EL2 without VHE, its TCR_EL2 in that layout.
+    // Once E2H is set, the CPU reads TCR_EL2 in the layout of TCR_EL1,
+    // where IPS (bits 34:32) is 0, a 32-bit physical address space, and
+    // T1SZ and EPD1 come from bits that meant other things: a fetch above
+    // 4 GiB, where the firmware may have loaded this code, then takes an
+    // address size fault, and so does the vector it goes to. So the stage
+    // of translation goes off first. UEFI maps this code one to one, so
+    // execution goes on at the same address, and nothing below touches
+    // memory until the stage is back on.
+    mrs x8, sctlr_el2
+    bic x8, x8, #1
+    msr sctlr_el2, x8
+    isb
+
     // Enable E2H if not already set
     mrs x8, hcr_el2
     orr x8, x8, #(1 << 34)
     msr hcr_el2, x8
     isb
 
+    // E2H may be cached in TLB entries: the firmware's go before the
+    // stage is back on.
+    tlbi alle2
+    dsb nsh
+    isb
+
     // Switch page tables using VHE-redirected register names.
     // Under VHE, *_el1 writes go to the EL2 register bank.
 
     // Point the exception handler to the continuation so that if we page fault
-    // during the switch, execution continues at the kernel entry.
+    // when the stage comes back on, execution continues at the kernel entry.
     adrp x8, 5f
     add x8, x8, #:lo12:5f
     add x8, x8, x7
@@ -130,11 +150,14 @@ enter_in_el2:
     dsb sy
     isb
 
-    // Switch the page table registers (VHE redirects to EL2), ordered as in
-    // enter_in_el1 above and for the same reason.
+    // Switch the page table registers (VHE redirects to EL2), all of them
+    // while the stage is off, then turn it on with Limine's tables.
     msr mair_el1, x3
     msr ttbr1_el1, x6
+    msr ttbr0_el1, x5
     msr tcr_el1, x4
+    isb
+    msr sctlr_el1, x2
     isb
     dsb sy
     isb
